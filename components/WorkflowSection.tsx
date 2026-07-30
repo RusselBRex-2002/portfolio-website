@@ -52,33 +52,8 @@ const STEPS = [
 ];
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-// Phase:
-//   0 = Title intro
-//   1..4 = image/content for STEPS[0..3]
-//   "v1","v2","v3" = transition videos between steps
 type Phase = 0 | 1 | 2 | 3 | 4 | "v1" | "v2" | "v3";
-
 const VIDEO_PHASES: Phase[] = ["v1", "v2", "v3"];
-
-// ─── Gesture-lock tuning ───────────────────────────────────────────────────
-// A gesture is "committed" (fires a phase change) once its accumulated
-// signed delta crosses this threshold. Kept low for discrete mouse-wheel
-// notches (which report large deltas per event) and requires real
-// deliberate movement for trackpads (which report a stream of small ones).
-const TRACKPAD_COMMIT_THRESHOLD = 60;
-// How long a partially-accumulated gesture can sit idle before we treat it
-// as abandoned/noise and reset it back to zero.
-const GESTURE_ABANDON_MS = 150;
-// While an animation/video transition is in flight, how often to re-check
-// whether it has finished yet.
-const UNLOCK_RECHECK_MS = 150;
-// Once the animation has genuinely finished, wait this long before
-// accepting new input — just long enough to swallow the last bit of
-// momentum from the gesture that just fired. This window is FIXED: it is
-// not extended by further scrolling, so the section becomes responsive
-// again shortly after the UI settles instead of staying locked for as
-// long as the user keeps touching the trackpad.
-const POST_ANIMATION_BUFFER_MS = 250;
 
 export function WorkflowSection() {
   const sectionRef = useRef<HTMLDivElement>(null);
@@ -91,8 +66,8 @@ export function WorkflowSection() {
   const progressRef = useRef<HTMLDivElement>(null);
   const indicatorRefs = useRef<(HTMLDivElement | null)[]>([]);
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
-  const imgRefs = useRef<(HTMLDivElement | null)[]>([]);   // wrapper divs for each step image+content
-  const videoLayerRefs = useRef<(HTMLDivElement | null)[]>([]); // wrapper divs for each video
+  const imgRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const videoLayerRefs = useRef<(HTMLDivElement | null)[]>([]);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const stageLabelRef = useRef<HTMLSpanElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
@@ -102,18 +77,10 @@ export function WorkflowSection() {
   const isAnimatingRef = useRef<boolean>(false);
   const isVideoPlayingRef = useRef<boolean>(false);
 
-  // ─── Gesture-tracking refs ──────────────────────────────────────────────
-  // Single source of truth: while true, ALL wheel/touch input is ignored
-  // (aside from re-arming the unlock timer). Set the instant a gesture
-  // commits; released only after real quiet AND the animation has finished.
+  // ─── Input Lock ───────────────────────────────────────────────────────────
+  // Single source of truth: while true, ALL wheel/touch input is ignored.
+  // Set the instant a gesture commits; released only in the GSAP onComplete.
   const lockedRef = useRef<boolean>(false);
-  const unlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Signed (not absolute) accumulated wheel delta for the in-progress,
-  // not-yet-committed gesture. Signed accumulation means a single noisy or
-  // opposite-sign sample can't flip the detected direction.
-  const netDeltaRef = useRef<number>(0);
-  const abandonTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Populated while a video is playing; calling it skips to the post-video transition
   const skipVideoRef = useRef<(() => void) | null>(null);
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -145,9 +112,6 @@ export function WorkflowSection() {
   }, []);
 
   // ─── Layer Isolation & Stacking Helpers ───────────────────────────────────
-  // Guaranteed clean stacking: actively ensures the entering layer is always
-  // stacked on top (zIndex: 20) of the exiting layer (zIndex: 10), and all
-  // inactive layers are hidden with visibility: "hidden" and zIndex: 1.
   const setActiveLayer = useCallback((activeEl: HTMLElement | null) => {
     imgRefs.current.forEach((el) => {
       if (!el) return;
@@ -194,7 +158,7 @@ export function WorkflowSection() {
 
   // ─── Transition Logic ─────────────────────────────────────────────────────
 
-  // PHASE 0 → PHASE 1: Title zoom-out and Design image fade-in
+  // PHASE 0 → PHASE 1
   const doTitleToDesign = useCallback(() => {
     isAnimatingRef.current = true;
     hideHint();
@@ -206,7 +170,6 @@ export function WorkflowSection() {
     });
     prepareTransition(null, imgRefs.current[0]);
 
-    // Snap all elements to their expected starting state before animating.
     const designContent = imgRefs.current[0]?.querySelector(".wf-step-content");
     gsap.set(titleRef.current, { scale: 1, opacity: 1 });
     gsap.set(gridRef.current, { opacity: 0 });
@@ -216,6 +179,7 @@ export function WorkflowSection() {
       onComplete: () => {
         phaseRef.current = 1;
         isAnimatingRef.current = false;
+        lockedRef.current = false; // 🔓 UNLOCK
         setActiveLayer(imgRefs.current[0]);
         updateIndicators(0);
         showHint();
@@ -235,9 +199,8 @@ export function WorkflowSection() {
     }
   }, [hideHint, showHint, updateIndicators, prepareTransition, setActiveLayer]);
 
-  // PHASE n (image) → VIDEO → PHASE n+1 (image)
+  // PHASE n → VIDEO → PHASE n+1
   const doImageToVideoToImage = useCallback((fromStepIndex: number) => {
-    // fromStepIndex: 0 (design→develop), 1 (develop→deploy), 2 (deploy→success)
     const toStepIndex = fromStepIndex + 1;
     const videoIndex = fromStepIndex;
     const videoLayer = videoLayerRefs.current[videoIndex];
@@ -266,7 +229,7 @@ export function WorkflowSection() {
     tl.call(() => {
       if (videoEl) {
         videoEl.currentTime = 0;
-        videoEl.play().catch(() => { });
+        videoEl.play().catch(() => {});
       }
 
       const onEnd = () => {
@@ -288,6 +251,7 @@ export function WorkflowSection() {
             }
             phaseRef.current = (toStepIndex + 1) as Phase;
             isAnimatingRef.current = false;
+            lockedRef.current = false; // 🔓 UNLOCK
             setActiveLayer(toLayer);
             updateIndicators(toStepIndex);
             showHint();
@@ -327,8 +291,7 @@ export function WorkflowSection() {
     });
   }, [hideHint, showHint, updateIndicators, prepareTransition, setActiveLayer]);
 
-  // PHASE n → PHASE n-1: Direct image cross-fade retreat (no video)
-  // Used for backward navigation: 4→3, 3→2, 2→1
+  // PHASE n → PHASE n-1 (retreat)
   const doImageRetreat = useCallback((fromPhase: 2 | 3 | 4) => {
     const fromStepIndex = fromPhase - 1;
     const toStepIndex = fromPhase - 2;
@@ -347,7 +310,6 @@ export function WorkflowSection() {
     });
     prepareTransition(fromLayer, toLayer);
 
-    // Snap content to their expected starting state before animating.
     if (fromContent) gsap.set(fromContent, { y: 0, opacity: 1 });
     if (toContent) gsap.set(toContent, { y: -30, opacity: 0 });
     if (fromPhase === 4 && glowRef.current) gsap.set(glowRef.current, { opacity: 1 });
@@ -356,6 +318,7 @@ export function WorkflowSection() {
       onComplete: () => {
         phaseRef.current = (fromPhase - 1) as Phase;
         isAnimatingRef.current = false;
+        lockedRef.current = false; // 🔓 UNLOCK
         setActiveLayer(toLayer);
         updateIndicators(toStepIndex);
         showHint();
@@ -394,11 +357,11 @@ export function WorkflowSection() {
     if (phase === 0) {
       doTitleToDesign();
     } else if (phase === 1) {
-      doImageToVideoToImage(0); // Design → Video1 → Develop
+      doImageToVideoToImage(0);
     } else if (phase === 2) {
-      doImageToVideoToImage(1); // Develop → Video2 → Deploy
+      doImageToVideoToImage(1);
     } else if (phase === 3) {
-      doImageToVideoToImage(2); // Deploy → Video3 → Success
+      doImageToVideoToImage(2);
     } else if (phase === 4) {
       hideHint();
       const wrapper = wrapperRef.current;
@@ -409,8 +372,6 @@ export function WorkflowSection() {
         new CustomEvent("workflow:exit", { detail: { scrollTo: nextScrollY } })
       );
     }
-    // Any other phase value here is one of the video phases ("v1"/"v2"/"v3"),
-    // which is already fully handled by the isVideoPlayingRef branch above.
   }, [doTitleToDesign, doImageToVideoToImage, hideHint]);
 
   const handleRetreat = useCallback(() => {
@@ -419,7 +380,6 @@ export function WorkflowSection() {
     const phase = phaseRef.current;
 
     if (phase === 1) {
-      // Phase 1 → 0: reverse of doTitleToDesign
       isAnimatingRef.current = true;
       hideHint();
       prepareTransition(imgRefs.current[0], null);
@@ -431,6 +391,7 @@ export function WorkflowSection() {
         onComplete: () => {
           phaseRef.current = 0;
           isAnimatingRef.current = false;
+          lockedRef.current = false; // 🔓 UNLOCK
           setActiveLayer(null);
         },
       });
@@ -439,11 +400,8 @@ export function WorkflowSection() {
       tl.to(gridRef.current, { opacity: 0, duration: 0.4 }, 0.3);
       tl.to(titleRef.current, { scale: 1, opacity: 1, duration: 0.7, ease: "power2.out" }, 0.4);
     } else if (phase === 2 || phase === 3 || phase === 4) {
-      // Phases 4→3, 3→2, 2→1: direct image cross-fade
       doImageRetreat(phase);
     }
-    // phase === 0: nothing to retreat to (handled by handleExitUp instead).
-    // Video phases: blocked above by the isVideoPlayingRef guard.
   }, [hideHint, doImageRetreat, prepareTransition, setActiveLayer]);
 
   const handleExitUp = useCallback(() => {
@@ -469,7 +427,6 @@ export function WorkflowSection() {
         const ratio = entry.intersectionRatio;
         const wasInView = isInViewRef.current;
 
-        // Start capturing only when the section is essentially fullscreen (≥95%)
         if (ratio >= 0.95 && !wasInView) {
           isInViewRef.current = true;
           const wrapper = wrapperRef.current;
@@ -478,13 +435,11 @@ export function WorkflowSection() {
             new CustomEvent("workflow:enter", { detail: { scrollTo: exactTop } })
           );
         }
-        // Stop capturing once the section has mostly left the viewport (<10%)
         if (ratio < 0.1 && wasInView) {
           isInViewRef.current = false;
           window.dispatchEvent(new CustomEvent("workflow:exit", { detail: {} }));
         }
       },
-      // Fire the callback at multiple ratios so we can distinguish entering vs exiting
       { threshold: [0, 0.1, 0.5, 0.95, 1.0] }
     );
     observer.observe(section);
@@ -493,130 +448,55 @@ export function WorkflowSection() {
 
   // ─── Wheel & Touch Event Binding ──────────────────────────────────────────
   //
-  // Gesture model (unified across mouse wheel and trackpad):
-  //  1. Every incoming event accumulates into a single SIGNED delta total
-  //     for the current gesture (not per-source, not per-magnitude-class).
-  //  2. Once |total| crosses a threshold, the gesture "commits": we read the
-  //     direction off the accumulated sign (robust to one noisy/reversed
-  //     sample), fire the transition, and lock all further input.
-  //  3. The lock releases on its own once the animation has genuinely
-  //     finished, plus one short fixed buffer to swallow any last bit of
-  //     momentum. Continuing to scroll while locked does NOT push this
-  //     back out — otherwise the section would stay locked for as long as
-  //     the user kept touching the trackpad instead of becoming responsive
-  //     again as soon as the UI has settled.
+  // INPUT LOCK PATTERN:
+  //  1. `lockedRef` is the single gate. If true, every wheel/touch event is
+  //     ignored immediately.
+  //  2. On the first event of a new gesture we set lockedRef = true and fire
+  //     the transition.
+  //  3. lockedRef is reset to false ONLY inside the GSAP timeline onComplete.
+  //     No timers, no delta accumulation, no gesture-settling heuristics.
   //
-  // Previously, "mouse-like" (big single jump) and "trackpad" (small
-  // continuous jumps) events were routed through two entirely separate
-  // detectors with two separate locks. A single fast trackpad flick often
-  // produces *both* kinds of samples (large values up front, decaying to
-  // small ones), so it could fire once immediately via the mouse path and
-  // then fire again off leftover, sign-noisy trackpad accumulation once
-  // that path's shorter cooldown expired — which is what caused an
-  // occasional forward scroll to land back on the previous phase.
   useEffect(() => {
-    const resetGesture = () => {
-      netDeltaRef.current = 0;
-      if (abandonTimerRef.current) {
-        clearTimeout(abandonTimerRef.current);
-        abandonTimerRef.current = null;
-      }
-    };
-
-    // Called once, right when a gesture commits. Polls until the animation
-    // has genuinely finished, then waits one fixed buffer before unlocking.
-    // Unlike before, incoming wheel/touch events while locked do NOT reset
-    // or extend this — so continued scrolling can't keep the section
-    // locked indefinitely.
-    const scheduleUnlock = () => {
-      if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
-      const tryUnlock = () => {
-        if (isAnimatingRef.current || isVideoPlayingRef.current) {
-          // Still mid-transition — don't unlock yet, just check back soon.
-          unlockTimerRef.current = setTimeout(tryUnlock, UNLOCK_RECHECK_MS);
-          return;
-        }
-        // Animation has genuinely finished — give one short, fixed buffer
-        // to swallow any last bit of momentum, then unlock for good.
-        unlockTimerRef.current = setTimeout(() => {
-          lockedRef.current = false;
-          unlockTimerRef.current = null;
-        }, POST_ANIMATION_BUFFER_MS);
-      };
-      tryUnlock();
-    };
-
-    const commit = (goingDown: boolean) => {
-      resetGesture();
-      lockedRef.current = true;
-      scheduleUnlock();
-      if (goingDown) {
-        handleAdvance();
-      } else {
-        handleRetreat();
-      }
-    };
-
-    // ── Main wheel handler ───────────────────────────────────────────────────
-    // Use CAPTURE phase so this fires before Lenis (which listens in bubble phase).
     const onWheel = (e: WheelEvent) => {
       if (!isInViewRef.current) return;
 
-      const phase = phaseRef.current;
-
-      // Allow natural page scroll at the top boundary — let Lenis handle it.
-      // Guarded by !isAnimatingRef so this can't fire mid-way through the
-      // phase 0 → 1 title animation (phase stays 0 until that completes).
-      if (phase === 0 && e.deltaY < 0 && !isAnimatingRef.current) {
-        window.dispatchEvent(new CustomEvent("workflow:exit", { detail: {} }));
-        return; // no preventDefault — Lenis (now started) receives the event
-      }
-
-      // Consume the event fully — prevents Lenis from also scrolling the page
       e.preventDefault();
       e.stopPropagation();
 
-      // Locked (mid-transition, or briefly settling right after one):
-      // ignore input entirely. The unlock timer runs independently and is
-      // not affected by continuing to scroll.
+      // 🔒 Input lock — block everything while a transition is running
       if (lockedRef.current) return;
 
-      // A transition video is playing: scrolling forward skips straight to
-      // the next step; backward input is simply ignored while it plays.
+      const phase = phaseRef.current;
+      const goingDown = e.deltaY > 0;
+
+      // Top boundary: hand off to native scroll
+      if (phase === 0 && !goingDown) {
+        handleExitUp();
+        return;
+      }
+
+      // Video playing: skip forward only
       if (isVideoPlayingRef.current) {
-        if (e.deltaY > 0 && skipVideoRef.current) {
+        if (goingDown && skipVideoRef.current) {
           lockedRef.current = true;
-          scheduleUnlock();
           skipVideoRef.current();
         }
         return;
       }
 
-      if (isAnimatingRef.current) return;
+      // Bottom boundary exit: no animation to unlock us, so don't lock
+      if (phase === 4 && goingDown) {
+        handleAdvance();
+        return;
+      }
 
-      // Accumulate this gesture's signed delta.
-      netDeltaRef.current += e.deltaY;
-      if (abandonTimerRef.current) clearTimeout(abandonTimerRef.current);
-      abandonTimerRef.current = setTimeout(() => {
-        // No further events for a while — treat as noise/hesitation, not a
-        // committed gesture. Start fresh next time.
-        netDeltaRef.current = 0;
-        abandonTimerRef.current = null;
-      }, GESTURE_ABANDON_MS);
-
-      // Mouse wheels report line-mode deltas or large per-notch jumps, so a
-      // single notch should commit immediately. Trackpads report a stream
-      // of small pixel deltas and need real accumulated movement before we
-      // treat it as an intentional gesture rather than an accidental brush.
-      const isMouseLike = e.deltaMode === 1 || Math.abs(e.deltaY) >= 50;
-      const threshold = isMouseLike ? 1 : TRACKPAD_COMMIT_THRESHOLD;
-
-      if (Math.abs(netDeltaRef.current) < threshold) return;
-
-      const goingDown = netDeltaRef.current > 0;
-      // phase 0 + going up is already handled by the early-return above, so
-      // by construction we only reach a "going up" commit when phase !== 0.
-      commit(goingDown);
+      // 🔒 Lock immediately and commit
+      lockedRef.current = true;
+      if (goingDown) {
+        handleAdvance();
+      } else {
+        handleRetreat();
+      }
     };
 
     // ── Touch support (mobile) ───────────────────────────────────────────────
@@ -630,35 +510,40 @@ export function WorkflowSection() {
       const delta = touchStartY - e.changedTouches[0].clientY;
       if (Math.abs(delta) < 40) return;
 
-      const phase = phaseRef.current;
-
-      // Mirror the wheel handler: swipe-down at the very top boundary hands
-      // off to native scroll instead of being captured.
-      if (phase === 0 && delta < 0 && !isAnimatingRef.current) {
-        handleExitUp();
-        return;
-      }
-
       e.preventDefault();
       e.stopPropagation();
 
       if (lockedRef.current) return;
 
+      const phase = phaseRef.current;
+      const goingDown = delta > 0;
+
+      if (phase === 0 && !goingDown) {
+        handleExitUp();
+        return;
+      }
+
       if (isVideoPlayingRef.current) {
-        if (delta > 0 && skipVideoRef.current) {
+        if (goingDown && skipVideoRef.current) {
           lockedRef.current = true;
-          scheduleUnlock();
           skipVideoRef.current();
         }
         return;
       }
 
-      if (isAnimatingRef.current) return;
+      if (phase === 4 && goingDown) {
+        handleAdvance();
+        return;
+      }
 
-      commit(delta > 0);
+      lockedRef.current = true;
+      if (goingDown) {
+        handleAdvance();
+      } else {
+        handleRetreat();
+      }
     };
 
-    // capture:true → runs before any bubble-phase listener (incl. Lenis)
     window.addEventListener("wheel", onWheel, { passive: false, capture: true });
     window.addEventListener("touchstart", onTouchStart, { passive: true });
     window.addEventListener("touchend", onTouchEnd, { passive: false, capture: true });
@@ -667,22 +552,17 @@ export function WorkflowSection() {
       window.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
       window.removeEventListener("touchstart", onTouchStart);
       window.removeEventListener("touchend", onTouchEnd, { capture: true } as EventListenerOptions);
-      // Cancel any pending timers
-      if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
-      if (abandonTimerRef.current) clearTimeout(abandonTimerRef.current);
     };
   }, [handleAdvance, handleRetreat, handleExitUp]);
 
   // ─── Initial GSAP Setup ───────────────────────────────────────────────────
   useEffect(() => {
-    // Set initial states — all image/video layers hidden cleanly with zIndex: 1
     setActiveLayer(null);
     if (gridRef.current) gsap.set(gridRef.current, { opacity: 0 });
     if (glowRef.current) gsap.set(glowRef.current, { opacity: 0 });
     if (hintRef.current) gsap.set(hintRef.current, { opacity: 0 });
     if (progressRef.current) gsap.set(progressRef.current, { height: "0%" });
 
-    // Animate title in
     if (titleRef.current) {
       gsap.fromTo(
         titleRef.current,
@@ -690,7 +570,6 @@ export function WorkflowSection() {
         { scale: 1, opacity: 1, duration: 1.2, ease: "power3.out", delay: 0.3 }
       );
     }
-    // Show scroll hint after title appears
     setTimeout(() => {
       if (hintRef.current) gsap.to(hintRef.current, { opacity: 1, duration: 0.5 });
     }, 1600);
@@ -703,7 +582,6 @@ export function WorkflowSection() {
       ref={wrapperRef}
       style={{ position: "relative", width: "100%", background: "#000", height: "100vh", margin: 0, padding: 0 }}
     >
-      {/* The section is sticky-viewport-height, no scroll within it — scroll is captured by the window handler */}
       <section
         ref={sectionRef}
         id="workflow"
@@ -812,7 +690,7 @@ export function WorkflowSection() {
           </div>
         ))}
       </section>
-
+      
       {/* ── Styles ── */}
       <style jsx>{`
         .wf-grid-bg {
@@ -880,7 +758,6 @@ export function WorkflowSection() {
           font-family: monospace;
         }
 
-        /* ── Media Layers ── */
         .wf-media-layer {
           position: absolute;
           inset: 0;
@@ -907,7 +784,6 @@ export function WorkflowSection() {
           background: linear-gradient(to top, rgba(0,0,0,0.7), rgba(0,0,0,0.15), rgba(0,0,0,0.4));
         }
 
-        /* ── Step Content Card ── */
         .wf-step-content {
           position: absolute;
           left: 6%;
@@ -959,7 +835,6 @@ export function WorkflowSection() {
           margin: 0;
         }
 
-        /* ── Video Badge ── */
         .wf-video-badge {
           position: absolute;
           top: 7%;
@@ -994,7 +869,6 @@ export function WorkflowSection() {
           50% { opacity: 0.5; transform: scale(0.75); }
         }
 
-        /* ── Left Progress Track ── */
         .wf-progress-track {
           position: absolute;
           left: 3.5%;
@@ -1015,7 +889,6 @@ export function WorkflowSection() {
           border-radius: 2px;
         }
 
-        /* ── Right Step Indicators ── */
         .wf-indicators {
           position: absolute;
           right: 3.5%;
@@ -1056,7 +929,6 @@ export function WorkflowSection() {
           color: #06b6d4;
         }
 
-        /* ── Bottom Bar ── */
         .wf-bottom-bar {
           position: absolute;
           bottom: 6%;
@@ -1113,7 +985,6 @@ export function WorkflowSection() {
           border-radius: 2px;
         }
 
-        /* ── Scroll Hint ── */
         .wf-scroll-hint {
           position: absolute;
           bottom: 15%;
