@@ -158,8 +158,9 @@ export function WorkflowSection() {
 
   // ─── Transition Logic ─────────────────────────────────────────────────────
 
-  // PHASE 0 → PHASE 1
+  // PHASE 0 → PHASE 1: Title zoom-out and Design image fade-in
   const doTitleToDesign = useCallback(() => {
+    lockedRef.current = true; // 🔒 LOCK — released only in onComplete
     isAnimatingRef.current = true;
     hideHint();
     videoRefs.current.forEach((vid) => {
@@ -179,10 +180,16 @@ export function WorkflowSection() {
       onComplete: () => {
         phaseRef.current = 1;
         isAnimatingRef.current = false;
-        lockedRef.current = false; // 🔓 UNLOCK
         setActiveLayer(imgRefs.current[0]);
         updateIndicators(0);
         showHint();
+        // 🔒 Hold the lock after animation ends to absorb trackpad scroll momentum.
+        // Other phases are protected by multi-second video playback; this fills
+        // that gap for phase 1 (Design image has no video buffer before it).
+        // lockedRef stays TRUE until this timer fires — no scroll input gets through.
+        setTimeout(() => {
+          lockedRef.current = false; // 🔓 UNLOCK — momentum has settled
+        }, 700);
       },
     });
 
@@ -199,7 +206,7 @@ export function WorkflowSection() {
     }
   }, [hideHint, showHint, updateIndicators, prepareTransition, setActiveLayer]);
 
-  // PHASE n → VIDEO → PHASE n+1
+  // PHASE n (image) → VIDEO → PHASE n+1 (image)
   const doImageToVideoToImage = useCallback((fromStepIndex: number) => {
     const toStepIndex = fromStepIndex + 1;
     const videoIndex = fromStepIndex;
@@ -291,7 +298,7 @@ export function WorkflowSection() {
     });
   }, [hideHint, showHint, updateIndicators, prepareTransition, setActiveLayer]);
 
-  // PHASE n → PHASE n-1 (retreat)
+  // PHASE n → PHASE n-1: Direct image cross-fade retreat (no video)
   const doImageRetreat = useCallback((fromPhase: 2 | 3 | 4) => {
     const fromStepIndex = fromPhase - 1;
     const toStepIndex = fromPhase - 2;
@@ -380,6 +387,7 @@ export function WorkflowSection() {
     const phase = phaseRef.current;
 
     if (phase === 1) {
+      lockedRef.current = true; // 🔒 LOCK — released only in onComplete
       isAnimatingRef.current = true;
       hideHint();
       prepareTransition(imgRefs.current[0], null);
@@ -690,7 +698,7 @@ export function WorkflowSection() {
           </div>
         ))}
       </section>
-      
+
       {/* ── Styles ── */}
       <style jsx>{`
         .wf-grid-bg {
