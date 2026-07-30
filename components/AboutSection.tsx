@@ -110,7 +110,7 @@ export const AboutSection: React.FC = () => {
         {/* Section Header */}
         <motion.div
           style={{ y: yHeader, opacity: opacityHeader }}
-          className="flex flex-col space-y-2 mb-10 sm:mb-16 md:mb-20"
+          className="flex flex-col space-y-2 mb-20 sm:mb-26 md:mb-26"
         >
           <div className="flex items-center space-x-2 text-xs font-mono text-[#edff66] uppercase tracking-widest">
             <Sparkles className="w-3.5 h-3.5" />

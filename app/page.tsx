@@ -6,6 +6,8 @@ import { Hero } from "@/components/Hero";
 import { HeroBackground3D } from "@/components/HeroBackground3D";
 import { CustomCursor } from "@/components/CustomCursor";
 import { AboutSection } from "@/components/AboutSection";
+import { WorkflowSection } from "@/components/WorkflowSection";
+import { ProjectsSection } from "@/components/ProjectsSection";
 import Lenis from "lenis";
 
 export default function Home() {
@@ -24,8 +26,32 @@ export default function Home() {
 
     requestAnimationFrame(raf);
 
+    // WorkflowSection broadcasts these events to pause/resume Lenis
+    // while it handles its own discrete step-scroll transitions.
+    const onWorkflowEnter = (e: Event) => {
+      const detail = (e as CustomEvent<{ scrollTo?: number }>).detail;
+      if (detail?.scrollTo != null) {
+        lenis.scrollTo(detail.scrollTo, { immediate: true });
+        window.scrollTo(0, detail.scrollTo);
+      }
+      lenis.stop();
+    };
+    const onWorkflowExit = (e: Event) => {
+      lenis.start();
+      // Smoothly scroll to whatever position the workflow section finished at
+      const detail = (e as CustomEvent<{ scrollTo?: number }>).detail;
+      if (detail?.scrollTo != null) {
+        lenis.scrollTo(detail.scrollTo, { duration: 0.6, easing: (t) => 1 - Math.pow(1 - t, 3) });
+      }
+    };
+
+    window.addEventListener("workflow:enter", onWorkflowEnter);
+    window.addEventListener("workflow:exit", onWorkflowExit);
+
     return () => {
       lenis.destroy();
+      window.removeEventListener("workflow:enter", onWorkflowEnter);
+      window.removeEventListener("workflow:exit", onWorkflowExit);
     };
   }, []);
 
@@ -45,6 +71,12 @@ export default function Home() {
 
       {/* Section 2: About - The Human Behind the AI */}
       <AboutSection />
+
+      {/* Section 3: Interactive Animated Workflow (Design -> Develop -> Deploy -> Client Success) */}
+      <WorkflowSection />
+
+      {/* Section 4: Selected Projects Showcase */}
+      <ProjectsSection />
     </main>
   );
 }
