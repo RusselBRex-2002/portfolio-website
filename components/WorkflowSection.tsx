@@ -60,6 +60,26 @@ type Phase = 0 | 1 | 2 | 3 | 4 | "v1" | "v2" | "v3";
 
 const VIDEO_PHASES: Phase[] = ["v1", "v2", "v3"];
 
+// ─── Gesture-lock tuning ───────────────────────────────────────────────────
+// A gesture is "committed" (fires a phase change) once its accumulated
+// signed delta crosses this threshold. Kept low for discrete mouse-wheel
+// notches (which report large deltas per event) and requires real
+// deliberate movement for trackpads (which report a stream of small ones).
+const TRACKPAD_COMMIT_THRESHOLD = 60;
+// How long a partially-accumulated gesture can sit idle before we treat it
+// as abandoned/noise and reset it back to zero.
+const GESTURE_ABANDON_MS = 150;
+// While an animation/video transition is in flight, how often to re-check
+// whether it has finished yet.
+const UNLOCK_RECHECK_MS = 150;
+// Once the animation has genuinely finished, wait this long before
+// accepting new input — just long enough to swallow the last bit of
+// momentum from the gesture that just fired. This window is FIXED: it is
+// not extended by further scrolling, so the section becomes responsive
+// again shortly after the UI settles instead of staying locked for as
+// long as the user keeps touching the trackpad.
+const POST_ANIMATION_BUFFER_MS = 250;
+
 export function WorkflowSection() {
   const sectionRef = useRef<HTMLDivElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -81,19 +101,18 @@ export function WorkflowSection() {
   const phaseRef = useRef<Phase>(0);
   const isAnimatingRef = useRef<boolean>(false);
   const isVideoPlayingRef = useRef<boolean>(false);
-  // ─── Gesture-tracking refs (replaces flat debounce) ────────────────────────
-  // Shared gate: true while we must not accept a new advance from any source
-  const gestureLockedRef = useRef<boolean>(false);
-  // Mouse cooldown timer (cleared on cleanup)
-  const mouseCooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Trackpad: rolling accumulator of |deltaY| for the current gesture
-  const tpAccumulatorRef = useRef<number>(0);
-  // Trackpad: highest |deltaY| seen in the current gesture (to detect peak)
-  const tpPeakDeltaRef = useRef<number>(0);
-  // Trackpad: whether we already fired once for the current gesture
-  const tpFiredRef = useRef<boolean>(false);
-  // Trackpad: settle timer — resets gate after 200 ms of quiet
-  const tpSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ─── Gesture-tracking refs ──────────────────────────────────────────────
+  // Single source of truth: while true, ALL wheel/touch input is ignored
+  // (aside from re-arming the unlock timer). Set the instant a gesture
+  // commits; released only after real quiet AND the animation has finished.
+  const lockedRef = useRef<boolean>(false);
+  const unlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Signed (not absolute) accumulated wheel delta for the in-progress,
+  // not-yet-committed gesture. Signed accumulation means a single noisy or
+  // opposite-sign sample can't flip the detected direction.
+  const netDeltaRef = useRef<number>(0);
+  const abandonTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Populated while a video is playing; calling it skips to the post-video transition
   const skipVideoRef = useRef<(() => void) | null>(null);
 
@@ -361,7 +380,7 @@ export function WorkflowSection() {
     }
   }, [hideHint, showHint, updateIndicators, prepareTransition, setActiveLayer]);
 
-  // ─── Scroll Handler ───────────────────────────────────────────────────────
+  // ─── Advance / Retreat / Exit ──────────────────────────────────────────────
   const handleAdvance = useCallback(() => {
     const phase = phaseRef.current;
 
@@ -390,6 +409,8 @@ export function WorkflowSection() {
         new CustomEvent("workflow:exit", { detail: { scrollTo: nextScrollY } })
       );
     }
+    // Any other phase value here is one of the video phases ("v1"/"v2"/"v3"),
+    // which is already fully handled by the isVideoPlayingRef branch above.
   }, [doTitleToDesign, doImageToVideoToImage, hideHint]);
 
   const handleRetreat = useCallback(() => {
@@ -419,8 +440,10 @@ export function WorkflowSection() {
       tl.to(titleRef.current, { scale: 1, opacity: 1, duration: 0.7, ease: "power2.out" }, 0.4);
     } else if (phase === 2 || phase === 3 || phase === 4) {
       // Phases 4→3, 3→2, 2→1: direct image cross-fade
-      doImageRetreat(phase as 2 | 3 | 4);
+      doImageRetreat(phase);
     }
+    // phase === 0: nothing to retreat to (handled by handleExitUp instead).
+    // Video phases: blocked above by the isVideoPlayingRef guard.
   }, [hideHint, doImageRetreat, prepareTransition, setActiveLayer]);
 
   const handleExitUp = useCallback(() => {
@@ -469,21 +492,69 @@ export function WorkflowSection() {
   }, []);
 
   // ─── Wheel & Touch Event Binding ──────────────────────────────────────────
+  //
+  // Gesture model (unified across mouse wheel and trackpad):
+  //  1. Every incoming event accumulates into a single SIGNED delta total
+  //     for the current gesture (not per-source, not per-magnitude-class).
+  //  2. Once |total| crosses a threshold, the gesture "commits": we read the
+  //     direction off the accumulated sign (robust to one noisy/reversed
+  //     sample), fire the transition, and lock all further input.
+  //  3. The lock releases on its own once the animation has genuinely
+  //     finished, plus one short fixed buffer to swallow any last bit of
+  //     momentum. Continuing to scroll while locked does NOT push this
+  //     back out — otherwise the section would stay locked for as long as
+  //     the user kept touching the trackpad instead of becoming responsive
+  //     again as soon as the UI has settled.
+  //
+  // Previously, "mouse-like" (big single jump) and "trackpad" (small
+  // continuous jumps) events were routed through two entirely separate
+  // detectors with two separate locks. A single fast trackpad flick often
+  // produces *both* kinds of samples (large values up front, decaying to
+  // small ones), so it could fire once immediately via the mouse path and
+  // then fire again off leftover, sign-noisy trackpad accumulation once
+  // that path's shorter cooldown expired — which is what caused an
+  // occasional forward scroll to land back on the previous phase.
   useEffect(() => {
-    // ── Helpers ──────────────────────────────────────────────────────────────
-    /**
-     * Classify the WheelEvent source.
-     * Mouse wheels report deltaMode=1 (LINE mode) or very large pixel deltas.
-     * Trackpad/touchpad always uses deltaMode=0 (PIXEL mode) with small values.
-     */
-    const isMouseLike = (e: WheelEvent): boolean =>
-      e.deltaMode === 1 || Math.abs(e.deltaY) >= 50;
+    const resetGesture = () => {
+      netDeltaRef.current = 0;
+      if (abandonTimerRef.current) {
+        clearTimeout(abandonTimerRef.current);
+        abandonTimerRef.current = null;
+      }
+    };
 
-    // Reset all trackpad gesture state
-    const resetTrackpad = () => {
-      tpAccumulatorRef.current = 0;
-      tpPeakDeltaRef.current = 0;
-      tpFiredRef.current = false;
+    // Called once, right when a gesture commits. Polls until the animation
+    // has genuinely finished, then waits one fixed buffer before unlocking.
+    // Unlike before, incoming wheel/touch events while locked do NOT reset
+    // or extend this — so continued scrolling can't keep the section
+    // locked indefinitely.
+    const scheduleUnlock = () => {
+      if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
+      const tryUnlock = () => {
+        if (isAnimatingRef.current || isVideoPlayingRef.current) {
+          // Still mid-transition — don't unlock yet, just check back soon.
+          unlockTimerRef.current = setTimeout(tryUnlock, UNLOCK_RECHECK_MS);
+          return;
+        }
+        // Animation has genuinely finished — give one short, fixed buffer
+        // to swallow any last bit of momentum, then unlock for good.
+        unlockTimerRef.current = setTimeout(() => {
+          lockedRef.current = false;
+          unlockTimerRef.current = null;
+        }, POST_ANIMATION_BUFFER_MS);
+      };
+      tryUnlock();
+    };
+
+    const commit = (goingDown: boolean) => {
+      resetGesture();
+      lockedRef.current = true;
+      scheduleUnlock();
+      if (goingDown) {
+        handleAdvance();
+      } else {
+        handleRetreat();
+      }
     };
 
     // ── Main wheel handler ───────────────────────────────────────────────────
@@ -493,94 +564,59 @@ export function WorkflowSection() {
 
       const phase = phaseRef.current;
 
-      // Allow natural page scroll at boundaries — let Lenis handle them
-      // Phase=0 upscroll → restart Lenis (stopped during workflow) then let the
-      // event propagate so Lenis scrolls back up to the previous section.
-      // Without the dispatch, Lenis is still stopped and ignores the event.
-      if (phase === 0 && e.deltaY < 0) {
+      // Allow natural page scroll at the top boundary — let Lenis handle it.
+      // Guarded by !isAnimatingRef so this can't fire mid-way through the
+      // phase 0 → 1 title animation (phase stays 0 until that completes).
+      if (phase === 0 && e.deltaY < 0 && !isAnimatingRef.current) {
         window.dispatchEvent(new CustomEvent("workflow:exit", { detail: {} }));
         return; // no preventDefault — Lenis (now started) receives the event
       }
-      // Phase=4 upscroll now falls through to handleRetreat(), which calls
-      // doImageRetreat(4) and retreats to phase=3 (Deploy).
-      // (The old "restart Lenis + exit" early return was removed so the full
-      //  reverse chain 4→3→2→1→0 works and phase=0 upscroll exits naturally.)
 
       // Consume the event fully — prevents Lenis from also scrolling the page
       e.preventDefault();
       e.stopPropagation();
 
-      // Never process input while a GSAP animation is in flight
-      if (isAnimatingRef.current) return;
+      // Locked (mid-transition, or briefly settling right after one):
+      // ignore input entirely. The unlock timer runs independently and is
+      // not affected by continuing to scroll.
+      if (lockedRef.current) return;
 
-      const absDelta = Math.abs(e.deltaY);
-      const goingDown = e.deltaY > 0;
-
-      // ── PATH A: Mouse wheel ─────────────────────────────────────────────────
-      if (isMouseLike(e)) {
-        // Flat cooldown: ignore events while locked
-        if (gestureLockedRef.current) return;
-
-        // Lock immediately; release after 600 ms
-        // (animations take ~700–900 ms, so isAnimatingRef will also guard the bulk
-        // of that window — the 600 ms cooldown covers the gap after it clears)
-        gestureLockedRef.current = true;
-        if (mouseCooldownRef.current) clearTimeout(mouseCooldownRef.current);
-        mouseCooldownRef.current = setTimeout(() => {
-          gestureLockedRef.current = false;
-          mouseCooldownRef.current = null;
-        }, 600);
-
-        if (goingDown) {
-          handleAdvance();
-        } else {
-          if (phase === 0) handleExitUp();
-          else handleRetreat();
+      // A transition video is playing: scrolling forward skips straight to
+      // the next step; backward input is simply ignored while it plays.
+      if (isVideoPlayingRef.current) {
+        if (e.deltaY > 0 && skipVideoRef.current) {
+          lockedRef.current = true;
+          scheduleUnlock();
+          skipVideoRef.current();
         }
         return;
       }
 
-      // ── PATH B: Trackpad / continuous scroll ────────────────────────────────
-      // Strategy: accumulate velocity, fire when the gesture peaks then
-      // decelerates, then wait for 200 ms of quiet before unlocking.
+      if (isAnimatingRef.current) return;
 
-      // Accumulate the absolute velocity of the current gesture
-      tpAccumulatorRef.current += absDelta;
+      // Accumulate this gesture's signed delta.
+      netDeltaRef.current += e.deltaY;
+      if (abandonTimerRef.current) clearTimeout(abandonTimerRef.current);
+      abandonTimerRef.current = setTimeout(() => {
+        // No further events for a while — treat as noise/hesitation, not a
+        // committed gesture. Start fresh next time.
+        netDeltaRef.current = 0;
+        abandonTimerRef.current = null;
+      }, GESTURE_ABANDON_MS);
 
-      // Track the peak per-event delta for this gesture
-      if (absDelta > tpPeakDeltaRef.current) {
-        tpPeakDeltaRef.current = absDelta;
-      }
+      // Mouse wheels report line-mode deltas or large per-notch jumps, so a
+      // single notch should commit immediately. Trackpads report a stream
+      // of small pixel deltas and need real accumulated movement before we
+      // treat it as an intentional gesture rather than an accidental brush.
+      const isMouseLike = e.deltaMode === 1 || Math.abs(e.deltaY) >= 50;
+      const threshold = isMouseLike ? 1 : TRACKPAD_COMMIT_THRESHOLD;
 
-      // Detect a committed gesture: we've seen meaningful motion AND the current
-      // event is decelerating past 40 % of the peak (finger lifting)
-      const pastPeak =
-        tpPeakDeltaRef.current > 0 &&
-        absDelta < tpPeakDeltaRef.current * 0.4;
-      const enoughAccumulated = tpAccumulatorRef.current > 60;
+      if (Math.abs(netDeltaRef.current) < threshold) return;
 
-      if (pastPeak && enoughAccumulated && !tpFiredRef.current && !gestureLockedRef.current) {
-        // Commit: fire exactly once for this gesture
-        tpFiredRef.current = true;
-        gestureLockedRef.current = true;
-
-        if (goingDown) {
-          handleAdvance();
-        } else {
-          if (phase === 0) handleExitUp();
-          else handleRetreat();
-        }
-      }
-
-      // Settle timer: reset gesture state after 200 ms of no wheel events.
-      // This covers the inertia tail — events keep arriving but absDelta is tiny.
-      if (tpSettleTimerRef.current) clearTimeout(tpSettleTimerRef.current);
-      tpSettleTimerRef.current = setTimeout(() => {
-        // Inertia has fully stopped
-        resetTrackpad();
-        gestureLockedRef.current = false;
-        tpSettleTimerRef.current = null;
-      }, 200);
+      const goingDown = netDeltaRef.current > 0;
+      // phase 0 + going up is already handled by the early-return above, so
+      // by construction we only reach a "going up" commit when phase !== 0.
+      commit(goingDown);
     };
 
     // ── Touch support (mobile) ───────────────────────────────────────────────
@@ -595,22 +631,31 @@ export function WorkflowSection() {
       if (Math.abs(delta) < 40) return;
 
       const phase = phaseRef.current;
-      if (phase === 0 && delta < 0) {
+
+      // Mirror the wheel handler: swipe-down at the very top boundary hands
+      // off to native scroll instead of being captured.
+      if (phase === 0 && delta < 0 && !isAnimatingRef.current) {
         handleExitUp();
-        return;
-      }
-      if (phase === 4 && delta > 0) {
-        handleAdvance();
         return;
       }
 
       e.preventDefault();
       e.stopPropagation();
 
-      if (gestureLockedRef.current || isAnimatingRef.current) return;
+      if (lockedRef.current) return;
 
-      if (delta > 0) handleAdvance();
-      else handleRetreat();
+      if (isVideoPlayingRef.current) {
+        if (delta > 0 && skipVideoRef.current) {
+          lockedRef.current = true;
+          scheduleUnlock();
+          skipVideoRef.current();
+        }
+        return;
+      }
+
+      if (isAnimatingRef.current) return;
+
+      commit(delta > 0);
     };
 
     // capture:true → runs before any bubble-phase listener (incl. Lenis)
@@ -623,10 +668,10 @@ export function WorkflowSection() {
       window.removeEventListener("touchstart", onTouchStart);
       window.removeEventListener("touchend", onTouchEnd, { capture: true } as EventListenerOptions);
       // Cancel any pending timers
-      if (mouseCooldownRef.current) clearTimeout(mouseCooldownRef.current);
-      if (tpSettleTimerRef.current) clearTimeout(tpSettleTimerRef.current);
+      if (unlockTimerRef.current) clearTimeout(unlockTimerRef.current);
+      if (abandonTimerRef.current) clearTimeout(abandonTimerRef.current);
     };
-  }, [handleAdvance, handleRetreat]);
+  }, [handleAdvance, handleRetreat, handleExitUp]);
 
   // ─── Initial GSAP Setup ───────────────────────────────────────────────────
   useEffect(() => {
